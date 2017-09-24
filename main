@@ -1,0 +1,202 @@
+#include "usart.h"
+#include "delay.h"
+#include "sys.h"
+#include "ucos_ii.h"
+#include "os_cpu.h"
+#include "includes.h"
+#include "os_cfg.h"
+#include "led.h"
+#include "pwm.h"
+#include "remote.h"
+#include "FONT.H"
+#include "lcd.h"
+#include "ds18b20.h"
+
+/////////////////////////UCOSII 任务设置///////////////////////////////////
+//START 任务
+//设置任务优先级
+#define START_TASK_PRIO 10 //开始任务的优先级设置为最低
+//设置任务堆栈大小
+#define START_STK_SIZE 64
+//任务堆栈
+OS_STK START_TASK_STK[START_STK_SIZE];
+//任务函数
+void start_task(void *pdata);
+//普通模式风扇调速任务
+#define NORMALSPEEDADJUST_TASK_PRIO 8 //设置任务优先级
+#define NORMALSPEEDADJUST_STK_SIZE 64 //设置任务堆栈大小
+OS_STK NORMALSPEEDADJUST_TASK_STK[NORMALSPEEDADJUST_STK_SIZE]; //任务堆栈
+void NormalSpeedAdjust_task(void *pdata); //任务函数
+//温度模式风扇调速任务
+#define TEMPSPEEDADJUST_TASK_PRIO 7 //设置任务优先级
+#define TEMPSPEEDADJUST_STK_SIZE 64 //设置任务堆栈大小
+OS_STK TEMPSPEEDADJUST_TASK_STK[TEMPSPEEDADJUST_STK_SIZE]; //任务堆栈
+void TempSpeedAdjust_task(void *pdata); //任务函数
+//DS18B20温度传感器任务
+#define TEMPSENSOR_TASK_PRIO 6 //设置任务优先级
+#define TEMPSENSOR_STK_SIZE 64 //设置任务堆栈大小
+OS_STK TEMPSENSOR_TASK_STK[TEMPSENSOR_STK_SIZE];//任务堆栈
+void TempSensor_task(void *pdata); //任务函数
+//模式转换任务
+#define MODECHANGE_TASK_PRIO 5 //设置任务优先级
+#define MODECHANGE_STK_SIZE 64 //设置任务堆栈大小
+OS_STK MODECHANGE_TASK_STK[MODECHANGE_STK_SIZE];//任务堆栈
+void ModeChange_task(void *pdata); //任务函数
+//遥控器输入值捕获任务
+#define REMOTEGET_TASK_PRIO 4 //设置任务优先级
+#define REMOTEGET_STK_SIZE 64 //设置任务堆栈大小
+OS_STK REMOTEGET_TASK_STK[REMOTEGET_STK_SIZE];//任务堆栈
+void RemoteGet_task(void *pdata); //任务函数
+//消息量，邮箱指针数据
+OS_EVENT *msg_mode;
+OS_EVENT *msg_speed;
+OS_EVENT *msg_temperature;
+OS_EVENT *sem_normal;
+OS_EVENT *sem_temp;
+
+//加载主界面
+void ucos_load_main_ui(void)
+{
+LCD_Clear(WHITE); //清屏
+POINT_COLOR=RED; //设置字体为红色
+LCD_ShowString(25,40,200,26,26,"Auto Speed Adjust Fan");
+LCD_ShowString(25,70,200,26,26,"Loading DS18B20");
+}
+//主函数
+int main(void)
+{
+delay_init(); //延时函数初始化
+uart_init(72);
+NVIC_PriorityGroupConfig(NVIC_PriorityGroup_2);
+LED_Init(); //初始化与 LED 连接的硬件接口
+LCD_Init(); //初始化 LCD
+TIM1_PWM_Init(899,0);//不分频。PWM频率=72000/(899+1)=80Khz
+ucos_load_main_ui(); //加载主界面
+Remote_Init();
+ while(DS18B20_Init())	//DS18B20初始化	
+{
+	LCD_ShowString(25,100,200,26,26,"DS18B20 Error");
+	delay_ms(200);
+	LCD_Fill(25,100,239,100+26,WHITE);
+ 	delay_ms(200);
+}								   
+LCD_ShowString(25,130,200,26,26,"DS18B20 OK");
+OSInit(); //初始化 UCOSII
+OSTaskCreate(start_task,(void *)0,(OS_STK *)&START_TASK_STK[START_STK_SIZE
+-1],START_TASK_PRIO );//创建起始任务
+OSStart();
+}
+//开始任务
+void start_task(void *pdata)
+{
+OS_CPU_SR cpu_sr=0;
+pdata = pdata;
+//创建消息邮箱与信号量。
+msg_mode=OSMboxCreate((void*)0);//工作模式：普通模式or温度模式
+msg_speed=OSMboxCreate((void*)0);//普通模式输入速度数值
+msg_temperature=OSMboxCreate((void*)0);//DS18B20温度探测器探测到的温度值
+sem_normal=OSSemCreate(0);//普通模式调速开启所需请求的信号量
+sem_temp=OSSemCreate(0);//温度模式调速开启所需请求的信号量
+OSStatInit(); //初始化统计任务.这里会延时 1 秒钟左右
+OS_ENTER_CRITICAL(); //进入临界区(无法被中断打断)
+OSTaskCreate(NormalSpeedAdjust_task,(void *)0,(OS_STK*)&NORMALSPEEDADJUST_TASK_STK[NORMALSPEEDADJUST_STK_SIZE-1],
+NORMALSPEEDADJUST_TASK_PRIO);
+OSTaskCreate(TempSpeedAdjust_task,(void *)0,(OS_STK*)&TEMPSPEEDADJUST_TASK_STK[TEMPSPEEDADJUST_STK_SIZE-1],
+TEMPSPEEDADJUST_TASK_PRIO);
+OSTaskCreate(TempSensor_task,(void *)0,(OS_STK*)&TEMPSENSOR_TASK_STK[TEMPSENSOR_STK_SIZE-1],
+TEMPSENSOR_TASK_PRIO);
+OSTaskCreate(ModeChange_task,(void *)0,(OS_STK*)&MODECHANGE_TASK_STK[MODECHANGE_STK_SIZE-1],
+MODECHANGE_TASK_PRIO);
+OSTaskCreate(RemoteGet_task,(void *)0,(OS_STK*)&REMOTEGET_TASK_STK[REMOTEGET_STK_SIZE-1],
+REMOTEGET_TASK_PRIO);
+OSTaskSuspend(START_TASK_PRIO); //挂起起始任务.
+OS_EXIT_CRITICAL(); //退出临界区(可以被中断打断)
+}
+//普通模式风扇调速任务
+void NormalSpeedAdjust_task()
+{
+	u32 speedlevel;
+	u8 err;
+	while(1)
+	{
+		OSSemPend(sem_normal,0,&err);
+		speedlevel=(u32)OSMboxPend(msg_speed,10,&err);
+		switch(speedlevel)
+		{
+			case 1:TIM_SetCompare1(TIM1,300);
+			case 2:TIM_SetCompare1(TIM1,200);
+			case 3:TIM_SetCompare1(TIM1,100);
+			//高速，中速，低速三挡的速度对应的PWM占空比分别为300，200，100。
+		}
+		delay_ms(10);	
+	}
+}
+//温度模式风扇调速任务
+void TempSpeedAdjust_task()
+{
+	u32 worktemp;
+	u16 tempspeed;
+	u8 err;
+	while(1)
+	{
+		OSSemPend(sem_temp,0,&err);
+		worktemp=(u32)OSMboxPend(msg_temperature,10,&err);
+		if(worktemp>230) 
+		tempspeed=(u16)(3*(worktemp-230));
+		else 
+		tempspeed=0;
+		//PWM输出占空比0—300，对应温度23摄氏度—33摄氏度。低于23摄氏度风扇停转。
+		//当PWM的输出占空比达到300时，风扇转速的变化就不是很明显了。
+		TIM_SetCompare1(TIM1,tempspeed);
+		delay_ms(10);
+	}
+}
+//DS18B20温度传感器任务
+void TempSensor_task(void *pdata)
+{
+	u32 temp;
+	while(1)
+	{
+	temp=(u32)DS18B20_Get_Temp();//DS18B20测得的温度值为short类型
+	OSMboxPost(msg_temperature,(void*)temp);//注意：temp的值为实际温度值的10倍。
+	delay_ms(10);
+	}
+}
+//模式转换任务
+void ModeChange_task(void *pdata)
+{
+	u32 mode=0;
+	u8 err;
+	while(1)
+	{
+		mode=(u32)OSMboxPend(msg_mode,10,&err);//请求消息邮箱得到数据
+		switch(mode)
+		{
+			case 4:LCD_ShowString(25,160,200,26,26,"Normal Mode");//发送信号量
+				   OSSemPost(sem_normal);
+			       break;
+			case 5:LCD_ShowString(25,160,200,26,26,"Temperature Mode");
+			       OSSemPost(sem_temp);
+			       break;
+		}
+		delay_ms(10);
+	}
+}
+//遥控器输入值捕获任务
+void RemoteGet_task(void *pdata)
+{
+	u8 remote;
+	while(1)
+	{
+		remote=Remote_Scan();
+		switch(remote)
+		{
+			case 34:OSMboxPost(msg_mode,(void*)4);break;//左侧按键对应普通模式
+			case 194:OSMboxPost(msg_mode,(void*)5);break;//右侧按键对应温度模式
+			case 104:OSMboxPost(msg_speed,(void*)1);break;//数字“1”键：风扇高速旋转
+			case 152:OSMboxPost(msg_speed,(void*)2);break;//数字“2”键：风扇中速旋转
+			case 176:OSMboxPost(msg_speed,(void*)3);break;//数字“3”键：风扇低速旋转
+		}
+		delay_ms(10);
+	}
+}
